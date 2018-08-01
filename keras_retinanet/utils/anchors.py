@@ -15,58 +15,120 @@ limitations under the License.
 """
 
 import numpy as np
+import keras
+
+from ..utils.compute_overlap import compute_overlap
 
 
 def anchor_targets_bbox(
-    image_shape,
-    annotations,
+    anchors,
+    image_group,
+    annotations_group,
     num_classes,
-    mask_shape=None,
     negative_overlap=0.4,
-    positive_overlap=0.5,
-    **kwargs
+    positive_overlap=0.5
 ):
-    anchors = anchors_for_shape(image_shape, **kwargs)
+    """ Generate anchor targets for bbox detection.
 
-    # label: 1 is positive, 0 is negative, -1 is dont care
-    labels = np.ones((anchors.shape[0], num_classes)) * -1
+    Args
+        anchors: np.array of annotations of shape (N, 4) for (x1, y1, x2, y2).
+        image_group: List of BGR images.
+        annotations_group: List of annotations (np.array of shape (N, 5) for (x1, y1, x2, y2, label)).
+        num_classes: Number of classes to predict.
+        mask_shape: If the image is padded with zeros, mask_shape can be used to mark the relevant part of the image.
+        negative_overlap: IoU overlap for negative anchors (all anchors with overlap < negative_overlap are negative).
+        positive_overlap: IoU overlap or positive anchors (all anchors with overlap > positive_overlap are positive).
 
-    if annotations.shape[0]:
-        # obtain indices of gt annotations with the greatest overlap
-        overlaps             = compute_overlap(anchors, annotations[:, :4])
-        argmax_overlaps_inds = np.argmax(overlaps, axis=1)
-        max_overlaps         = overlaps[np.arange(overlaps.shape[0]), argmax_overlaps_inds]
+    Returns
+        labels_batch: batch that contains labels & anchor states (np.array of shape (batch_size, N, num_classes + 1),
+                      where N is the number of anchors for an image and the last column defines the anchor state (-1 for ignore, 0 for bg, 1 for fg).
+        regression_batch: batch that contains bounding-box regression targets for an image & anchor states (np.array of shape (batch_size, N, 4 + 1),
+                      where N is the number of anchors for an image, the first 4 columns define regression targets for (x1, y1, x2, y2) and the
+                      last column defines anchor states (-1 for ignore, 0 for bg, 1 for fg).
+        boxes_batch: box regression targets (np.array of shape (batch_size, N, num_classes + 1), where N is the number of anchors for an image)
+    """
 
-        # assign bg labels first so that positive labels can clobber them
-        labels[max_overlaps < negative_overlap, :] = 0
+    assert (len(image_group) == len(annotations_group)), "The length of the images and annotations need to be equal."
+    assert (len(annotations_group) > 0), "No data received to compute anchor targets for."
 
-        # compute box regression targets
-        annotations = annotations[argmax_overlaps_inds]
+    batch_size = len(image_group)
 
-        # fg label: above threshold IOU
-        positive_indices = max_overlaps >= positive_overlap
-        labels[positive_indices, :] = 0
-        labels[positive_indices, annotations[positive_indices, 4].astype(int)] = 1
-    else:
-        # no annotations? then everything is background
-        labels[:] = 0
-        annotations = np.zeros_like(anchors)
+    regression_batch = np.zeros((batch_size, anchors.shape[0], 4 + 1), dtype=keras.backend.floatx())
+    labels_batch     = np.zeros((batch_size, anchors.shape[0], num_classes + 1), dtype=keras.backend.floatx())
+    boxes_batch      = np.zeros((batch_size, anchors.shape[0], annotations_group[0].shape[1]), dtype=keras.backend.floatx())
 
-    # ignore annotations outside of image
-    mask_shape         = image_shape if mask_shape is None else mask_shape
-    anchors_centers    = np.vstack([(anchors[:, 0] + anchors[:, 2]) / 2, (anchors[:, 1] + anchors[:, 3]) / 2]).T
-    indices            = np.logical_or(anchors_centers[:, 0] >= mask_shape[1], anchors_centers[:, 1] >= mask_shape[0])
-    labels[indices, :] = -1
+    # compute labels and regression targets
+    for index, (image, annotations) in enumerate(zip(image_group, annotations_group)):
+        if annotations.shape[0]:
+            # obtain indices of gt annotations with the greatest overlap
+            positive_indices, ignore_indices, argmax_overlaps_inds = compute_gt_annotations(anchors, annotations, negative_overlap, positive_overlap)
 
-    return labels, annotations, anchors
+            labels_batch[index, ignore_indices, -1]       = -1
+            labels_batch[index, positive_indices, -1]     = 1
+
+            regression_batch[index, ignore_indices, -1]   = -1
+            regression_batch[index, positive_indices, -1] = 1
+
+            # compute box regression targets
+            annotations = annotations[argmax_overlaps_inds]
+            boxes_batch[index, ...] = annotations
+
+            # compute target class labels
+            labels_batch[index, positive_indices, annotations[positive_indices, 4].astype(int)] = 1
+
+            regression_batch[index, :, :-1] = bbox_transform(anchors, annotations)
+
+        # ignore annotations outside of image
+        if image.shape:
+            anchors_centers = np.vstack([(anchors[:, 0] + anchors[:, 2]) / 2, (anchors[:, 1] + anchors[:, 3]) / 2]).T
+            indices = np.logical_or(anchors_centers[:, 0] >= image.shape[1], anchors_centers[:, 1] >= image.shape[0])
+
+            labels_batch[index, indices, -1]     = - 1
+            regression_batch[index, indices, -1] = -1
+
+    return labels_batch, regression_batch, boxes_batch
+
+
+def compute_gt_annotations(
+    anchors,
+    annotations,
+    negative_overlap=0.4,
+    positive_overlap=0.5
+):
+    """ Obtain indices of gt annotations with the greatest overlap.
+
+    Args
+        anchors: np.array of annotations of shape (N, 4) for (x1, y1, x2, y2).
+        annotations: np.array of shape (N, 5) for (x1, y1, x2, y2, label).
+        negative_overlap: IoU overlap for negative anchors (all anchors with overlap < negative_overlap are negative).
+        positive_overlap: IoU overlap or positive anchors (all anchors with overlap > positive_overlap are positive).
+
+    Returns
+        positive_indices: indices of positive anchors
+        ignore_indices: indices of ignored anchors
+        argmax_overlaps_inds: ordered overlaps indices
+    """
+
+    overlaps = compute_overlap(anchors.astype(np.float64), annotations.astype(np.float64))
+    argmax_overlaps_inds = np.argmax(overlaps, axis=1)
+    max_overlaps = overlaps[np.arange(overlaps.shape[0]), argmax_overlaps_inds]
+
+    # assign "dont care" labels
+    positive_indices = max_overlaps >= positive_overlap
+    ignore_indices = (max_overlaps > negative_overlap) & ~positive_indices
+
+    return positive_indices, ignore_indices, argmax_overlaps_inds
 
 
 def layer_shapes(image_shape, model):
     """Compute layer shapes given input image shape and the model.
 
-    :param image_shape:
-    :param model:
-    :return:
+    Args
+        image_shape: The shape of the image.
+        model: The model to use for computing how the image shape is transformed in the pyramid.
+
+    Returns
+        A dictionary mapping layer names to image shapes.
     """
     shape = {
         model.layers[0].name: (None,) + image_shape,
@@ -84,6 +146,8 @@ def layer_shapes(image_shape, model):
 
 
 def make_shapes_callback(model):
+    """ Make a function for getting the shape of the pyramid levels.
+    """
     def get_shapes(image_shape, pyramid_levels):
         shape = layer_shapes(image_shape, model)
         image_shapes = [shape["P{}".format(level)][1:3] for level in pyramid_levels]
@@ -95,9 +159,12 @@ def make_shapes_callback(model):
 def guess_shapes(image_shape, pyramid_levels):
     """Guess shapes based on pyramid levels.
 
-    :param image_shape:
-    :param pyramid_levels:
-    :return:
+    Args
+         image_shape: The shape of the image.
+         pyramid_levels: A list of what pyramid levels are used.
+
+    Returns
+        A list of image shapes at each pyramid level.
     """
     image_shape = np.array(image_shape[:2])
     image_shapes = [(image_shape + 2 ** x - 1) // (2 ** x) for x in pyramid_levels]
@@ -113,6 +180,20 @@ def anchors_for_shape(
     sizes=None,
     shapes_callback=None,
 ):
+    """ Generators anchors for a given shape.
+
+    Args
+        image_shape: The shape of the image.
+        pyramid_levels: List of ints representing which pyramids to use (defaults to [3, 4, 5, 6, 7]).
+        ratios: List of ratios with which anchors are generated (defaults to [0.5, 1, 2]).
+        scales: List of scales with which anchors are generated (defaults to [2^0, 2^(1/3), 2^(2/3)]).
+        strides: Stride per pyramid level, defines how the pyramids are constructed.
+        sizes: Sizes of the anchors per pyramid level.
+        shapes_callback: Function to call for getting the shape of the image at different pyramid levels.
+
+    Returns
+        np.array of shape (N, 4) containing the (x1, y1, x2, y2) coordinates for the anchors.
+    """
     if pyramid_levels is None:
         pyramid_levels = [3, 4, 5, 6, 7]
     if strides is None:
@@ -139,6 +220,13 @@ def anchors_for_shape(
 
 
 def shift(shape, stride, anchors):
+    """ Produce shifted anchors based on shape of the map and stride size.
+
+    Args
+        shape  : Shape to shift the anchors over.
+        stride : Stride to shift the anchors with over the shape.
+        anchors: The anchors to apply at each location.
+    """
     shift_x = (np.arange(0, shape[1]) + 0.5) * stride
     shift_y = (np.arange(0, shape[0]) + 0.5) * stride
 
@@ -227,30 +315,3 @@ def bbox_transform(anchors, gt_boxes, mean=None, std=None):
     targets = (targets - mean) / std
 
     return targets
-
-
-def compute_overlap(a, b):
-    """
-    Parameters
-    ----------
-    a: (N, 4) ndarray of float
-    b: (K, 4) ndarray of float
-    Returns
-    -------
-    overlaps: (N, K) ndarray of overlap between boxes and query_boxes
-    """
-    area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
-
-    iw = np.minimum(np.expand_dims(a[:, 2], axis=1), b[:, 2]) - np.maximum(np.expand_dims(a[:, 0], 1), b[:, 0])
-    ih = np.minimum(np.expand_dims(a[:, 3], axis=1), b[:, 3]) - np.maximum(np.expand_dims(a[:, 1], 1), b[:, 1])
-
-    iw = np.maximum(iw, 0)
-    ih = np.maximum(ih, 0)
-
-    ua = np.expand_dims((a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1]), axis=1) + area - iw * ih
-
-    ua = np.maximum(ua, np.finfo(float).eps)
-
-    intersection = iw * ih
-
-    return intersection / ua
